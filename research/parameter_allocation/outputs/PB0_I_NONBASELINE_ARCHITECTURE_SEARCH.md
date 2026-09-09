@@ -1,86 +1,72 @@
-# PB0-I Non-Baseline Architecture Search
+# PB0-I Exact Non-Baseline Architecture Verification
 
-## Scope
+## Purpose
 
-PB0-I searches for genuinely non-baseline Modus_X architectures near the frozen canonical parameter budget.
+PB0-I is the final parameter-accounting gate before any candidate training. PB0-G generated calibrated fixed-budget candidates; PB0-I instantiates the actual architecture and verifies the real parameter tree.
 
-The search uses the exact PB0-F calibrated parameter formula and verifies the highest-ranked candidates through the real Modus_X initializer.
+## Architecture Source of Truth
 
-No model source, checkpoint, dataset, or training run is modified.
+- Model: `Modus_X_MemoryFeedbackArchive`
+- Public factory call: `make_model(name, key, cfg, auxiliary_layers=..., future_target_count=...)`
+- Feedback rank rule: `min(32, ax_res, mamba_state_dim)`
 
-## Frozen Budget
+## Canonical Baseline Gate
 
-- Target parameters: **47,437,768**
-- Search tolerance: **±50,000**
+- B0 count: **47,437,768**
+- Actual instantiated count: **47,437,768**
+- Difference: **+0**
+- Exact: **True**
+- Tree fingerprint: `27e2206566ba1dbfa7cf4438ae716dc2091d6bcc344a8fe89355d89077824662`
 
-## Baseline Excluded
+## PB0-G Candidate Pool
 
-- r = 512
-- n = 512
-- h = 32
+- Candidates loaded from PB0-G: **500**
+- Non-baseline candidates verified here: **25**
 
-## Calibrated Formula
+## Exact Verification Results
 
-P = 12011080 + (36912 * r) + (30744 * n) + (12300 * h) + (12 * f * r) + (6144 * f)
+| # | r | n | h | f | PB0-G params | Actual params | Delta | Exact | Status |
+|---:|---:|---:|---:|---:|---:|---:|---:|---|---|
+| 1 | 512 | 520 | 12 | 32 | 47,437,720 | 47,437,720 | +0 | True | `PASS_EXACT_PB0_G` |
+| 2 | 512 | 504 | 52 | 32 | 47,437,816 | 47,437,816 | +0 | True | `PASS_EXACT_PB0_G` |
+| 3 | 512 | 496 | 72 | 32 | 47,437,864 | 47,437,864 | +0 | True | `PASS_EXACT_PB0_G` |
+| 4 | 512 | 488 | 92 | 32 | 47,437,912 | 47,437,912 | +0 | True | `PASS_EXACT_PB0_G` |
+| 5 | 360 | 704 | 13 | 32 | 47,437,924 | 47,437,924 | +0 | True | `PASS_EXACT_PB0_G` |
+| 6 | 512 | 480 | 112 | 32 | 47,437,960 | 47,437,960 | +0 | True | `PASS_EXACT_PB0_G` |
+| 7 | 360 | 696 | 33 | 32 | 47,437,972 | 47,437,972 | +0 | True | `PASS_EXACT_PB0_G` |
+| 8 | 328 | 704 | 110 | 32 | 47,437,552 | 47,437,552 | +0 | True | `PASS_EXACT_PB0_G` |
+| 9 | 360 | 688 | 53 | 32 | 47,438,020 | 47,438,020 | +0 | True | `PASS_EXACT_PB0_G` |
+| 10 | 328 | 712 | 90 | 32 | 47,437,504 | 47,437,504 | +0 | True | `PASS_EXACT_PB0_G` |
+| 11 | 360 | 680 | 73 | 32 | 47,438,068 | 47,438,068 | +0 | True | `PASS_EXACT_PB0_G` |
+| 12 | 328 | 720 | 70 | 32 | 47,437,456 | 47,437,456 | +0 | True | `PASS_EXACT_PB0_G` |
+| 13 | 360 | 672 | 93 | 32 | 47,438,116 | 47,438,116 | +0 | True | `PASS_EXACT_PB0_G` |
+| 14 | 328 | 728 | 50 | 32 | 47,437,408 | 47,437,408 | +0 | True | `PASS_EXACT_PB0_G` |
+| 15 | 360 | 664 | 113 | 32 | 47,438,164 | 47,438,164 | +0 | True | `PASS_EXACT_PB0_G` |
+| 16 | 328 | 736 | 30 | 32 | 47,437,360 | 47,437,360 | +0 | True | `PASS_EXACT_PB0_G` |
+| 17 | 480 | 520 | 109 | 32 | 47,437,348 | 47,437,348 | +0 | True | `PASS_EXACT_PB0_G` |
+| 18 | 328 | 744 | 10 | 32 | 47,437,312 | 47,437,312 | +0 | True | `PASS_EXACT_PB0_G` |
+| 19 | 480 | 528 | 89 | 32 | 47,437,300 | 47,437,300 | +0 | True | `PASS_EXACT_PB0_G` |
+| 20 | 480 | 536 | 69 | 32 | 47,437,252 | 47,437,252 | +0 | True | `PASS_EXACT_PB0_G` |
+| 21 | 480 | 544 | 49 | 32 | 47,437,204 | 47,437,204 | +0 | True | `PASS_EXACT_PB0_G` |
+| 22 | 480 | 552 | 29 | 32 | 47,437,156 | 47,437,156 | +0 | True | `PASS_EXACT_PB0_G` |
+| 23 | 480 | 560 | 9 | 32 | 47,437,108 | 47,437,108 | +0 | True | `PASS_EXACT_PB0_G` |
+| 24 | 392 | 664 | 16 | 32 | 47,438,536 | 47,438,536 | +0 | True | `PASS_EXACT_PB0_G` |
+| 25 | 296 | 736 | 127 | 32 | 47,436,988 | 47,436,988 | +0 | True | `PASS_EXACT_PB0_G` |
 
-where f = min(32, r, n)
+## Gate Decision
 
-## Search Result
+### PASSED — realizable fixed-budget candidates exist
 
-- Non-baseline candidates within tolerance: **500**
-- Exact non-baseline matches: **0**
-- Real initializer verifications: **25**
-- Exact formula/tree matches: **0**
+**25** verified non-baseline candidate(s) reproduce the PB0-G parameter count exactly and remain within the fixed canonical budget window.
 
-## Highest-Ranked Non-Baseline Candidate
+## Important Interpretation
 
-- Matrix rank r: **760**
-- Vector dimension n: **176**
-- Router hidden h: **120**
-- Feedback rank f: **32**
-- Predicted parameters: **47,439,592**
-- Parameter error: **+1,824**
-- Structural change score: **0.670312**
-- Balance score: **0.406036**
-- Overall ranking score: **0.649671**
+PB0-I does not establish that any candidate improves BPC. It only establishes that the candidate is a real, reproducible architecture under the current implementation and parameter accounting.
 
-## Interpretation
+A candidate must still pass an empirical training/validation screen before any architecture change is accepted.
 
-No genuinely non-baseline architecture exactly matches the frozen parameter budget inside the searched discrete space.
+## Next Gate
 
-An architecture should not be declared better than the baseline from parameter arithmetic alone. Parameter-count equivalence only establishes a fair budget comparison. Performance requires subsequent controlled evaluation.
+If PB0-I passes, train only the strongest verified candidate(s) under the same data, optimizer, schedule, seed policy, and evaluation protocol used for the canonical baseline.
 
-## Verification Results
-
-| Rank | r | n | h | Predicted | Actual | Error | Exact | Status |
-|---:|---:|---:|---:|---:|---:|---:|---|---|
-| 1 | 760 | 176 | 120 | 47,439,592 | N/A | N/A | N/A | failed |
-| 2 | 760 | 184 | 100 | 47,439,544 | N/A | N/A | N/A | failed |
-| 3 | 760 | 192 | 80 | 47,439,496 | N/A | N/A | N/A | failed |
-| 4 | 752 | 184 | 124 | 47,436,376 | N/A | N/A | N/A | failed |
-| 5 | 752 | 192 | 104 | 47,436,328 | N/A | N/A | N/A | failed |
-| 6 | 752 | 200 | 84 | 47,436,280 | N/A | N/A | N/A | failed |
-| 7 | 768 | 168 | 116 | 47,442,808 | N/A | N/A | N/A | failed |
-| 8 | 752 | 208 | 64 | 47,436,232 | N/A | N/A | N/A | failed |
-| 9 | 768 | 176 | 96 | 47,442,760 | N/A | N/A | N/A | failed |
-| 10 | 760 | 200 | 60 | 47,439,448 | N/A | N/A | N/A | failed |
-| 11 | 768 | 184 | 76 | 47,442,712 | N/A | N/A | N/A | failed |
-| 12 | 272 | 768 | 120 | 47,439,592 | N/A | N/A | N/A | failed |
-| 13 | 744 | 192 | 128 | 47,433,160 | N/A | N/A | N/A | failed |
-| 14 | 744 | 200 | 108 | 47,433,112 | N/A | N/A | N/A | failed |
-| 15 | 768 | 192 | 56 | 47,442,664 | N/A | N/A | N/A | failed |
-| 16 | 744 | 208 | 88 | 47,433,064 | N/A | N/A | N/A | failed |
-| 17 | 744 | 216 | 68 | 47,433,016 | N/A | N/A | N/A | failed |
-| 18 | 280 | 768 | 96 | 47,442,760 | N/A | N/A | N/A | failed |
-| 19 | 280 | 760 | 116 | 47,442,808 | N/A | N/A | N/A | failed |
-| 20 | 760 | 216 | 20 | 47,439,352 | N/A | N/A | N/A | failed |
-| 21 | 768 | 208 | 16 | 47,442,568 | N/A | N/A | N/A | failed |
-| 22 | 736 | 208 | 112 | 47,429,896 | N/A | N/A | N/A | failed |
-| 23 | 752 | 216 | 44 | 47,436,184 | N/A | N/A | N/A | failed |
-| 24 | 736 | 216 | 92 | 47,429,848 | N/A | N/A | N/A | failed |
-| 25 | 760 | 208 | 40 | 47,439,400 | N/A | N/A | N/A | failed |
-
-## Reproducibility
-
-- Search fingerprint: `b6b18fbdcf98360a5b72cf8a99eda76dae075ba8fbf3b8a3ffc2625cefafcf2a`
-- Generated UTC: `2026-09-09T15:54:45.122190+00:00`
+Do not modify `language/models.py` merely because PB0-G found a different allocation. Let the empirical BPC result determine whether a parameter-allocation change is justified.
