@@ -50,18 +50,63 @@ def batch_at(data: np.ndarray, starts: np.ndarray, seq_len: int) -> tuple[np.nda
     chunks = data[starts[:, None] + offsets[None, :]]
     return chunks[:, :-1].astype(np.int32), chunks[:, 1:].astype(np.int32)
 
-
-def make_starts(length: int, seq_len: int, count: int, seed: int) -> dict[str, np.ndarray]:
+def make_starts(
+    length: int,
+    seq_len: int,
+    count: int,
+    seed: int,
+) -> dict[str, np.ndarray]:
     max_start = length - seq_len - 1
-    rng = np.random.default_rng(seed)
-    count = min(count, max_start + 1)
-    return {
-        "linspace": np.linspace(0, max_start, count, dtype=np.int64),
-        "random": np.sort(rng.choice(max_start + 1, size=count, replace=False)),
-        "dense_offset_0": np.arange(0, max_start + 1, seq_len, dtype=np.int64),
-        "dense_offset_half": np.arange(seq_len // 2, max_start + 1, seq_len, dtype=np.int64),
-    }
 
+    rng = np.random.default_rng(seed)
+
+    count = min(count, max_start + 1)
+
+    dense_0_all = np.arange(
+        0,
+        max_start + 1,
+        seq_len,
+        dtype=np.int64,
+    )
+
+    dense_half_all = np.arange(
+        seq_len // 2,
+        max_start + 1,
+        seq_len,
+        dtype=np.int64,
+    )
+
+    dense_0_count = min(
+        count,
+        len(dense_0_all),
+    )
+
+    dense_half_count = min(
+        count,
+        len(dense_half_all),
+    )
+
+    return {
+        "linspace": np.linspace(
+            0,
+            max_start,
+            count,
+            dtype=np.int64,
+        ),
+        "random": np.sort(
+            rng.choice(
+                max_start + 1,
+                size=count,
+                replace=False,
+            )
+        ),
+        "dense_offset_0": dense_0_all[
+            :dense_0_count
+        ],
+        "dense_offset_half": dense_half_all[
+            :dense_half_count
+        ],
+    }
 
 def summarize(values: np.ndarray) -> dict:
     return {
