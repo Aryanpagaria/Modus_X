@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import pickle
+import sys
 import time
 from pathlib import Path
 
@@ -12,6 +13,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+LANGUAGE_DIR = Path(__file__).resolve().parents[2] / "language"
+sys.path.insert(0, str(LANGUAGE_DIR))
 
 from models import ModelConfig, count_params, make_model
 
