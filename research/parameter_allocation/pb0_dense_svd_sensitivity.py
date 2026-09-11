@@ -727,6 +727,8 @@ def load_canonical_splits(
         "Canonical dataset",
     )
 
+    raw: np.memmap | None = None
+
     try:
         raw = np.memmap(
             data_path,
@@ -832,7 +834,7 @@ def extract_primary_logits(
                 "Model forward function returned an empty tuple."
             )
 
-        logits = outputs[0]
+        logits = next(iter(outputs))
     else:
         logits = outputs
 
@@ -842,29 +844,32 @@ def extract_primary_logits(
 def evaluation_loss(
     params: Mapping[str, Any],
     fwd_fn: Any,
-    x: jax.Array,
-    y: jax.Array,
+    x: np.ndarray,
+    y: np.ndarray,
     loss_tail: int,
 ) -> jax.Array:
+    
     if loss_tail <= 0:
         fail(
             "Loss tail must be positive."
         )
 
-    outputs = jax.vmap(
-        lambda sequence: fwd_fn(
+    outputs = [
+        fwd_fn(
             params,
             sequence,
         )
-    )(x)
+        for sequence in x
+    ]
 
-    logits = extract_primary_logits(
-        outputs
+    logits = jnp.stack(
+        [
+            extract_primary_logits(output)
+            for output in outputs
+        ],
+        axis=0,
     )
 
-    logits = logits.astype(
-        jnp.float32
-    )
 
     if (
         loss_tail
@@ -942,10 +947,18 @@ def evaluate_bpc(
         dtype=np.int64,
     )
 
-    @jax.jit
+    # IMPORTANT:
+    # Do not JIT this function.
+    #
+    # The canonical Modus_X forward path performs a NumPy-backed
+    # embedding lookup. JAX-tracing batch_x would therefore produce
+    # TracerArrayConversionError.
+    #
+    # Keep evaluation in ordinary Python/NumPy and let the model
+    # forward function execute one sequence at a time.
     def eval_batch(
-        batch_x: jax.Array,
-        batch_y: jax.Array,
+        batch_x: np.ndarray,
+        batch_y: np.ndarray,
     ) -> jax.Array:
         return evaluation_loss(
             params,
@@ -987,13 +1000,20 @@ def evaluate_bpc(
             seq_len,
         )
 
+        # Keep x/y as NumPy arrays.
+        # Do NOT call jnp.asarray() here.
         value = eval_batch(
-            jnp.asarray(x),
-            jnp.asarray(y),
+            x,
+            y,
         )
 
         losses.append(
             float(value)
+        )
+        print(
+            f"  Evaluation progress: "
+            f"{min(offset + batch_size, chunks)}/{chunks} windows",
+            flush=True,
         )
 
     if not losses:
