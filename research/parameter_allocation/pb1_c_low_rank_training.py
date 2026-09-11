@@ -482,13 +482,8 @@ def factorized_memory_feedback_archive_layer_fwd(
         ),
     )
 
-    # Memory-safe reverse-mode differentiation:
-    # checkpoint the per-token recurrent step so XLA does not retain
-    # the full 512-step 512x512 matrix-state history.
-    checkpointed_step = jax.checkpoint(step)
-
     _, out = jax.lax.scan(
-        checkpointed_step,
+        step,
         initial_state,
         x_seq,
     )
@@ -510,25 +505,19 @@ def factorized_deep_supervision_fwd(
 ):
     x = p["embed"][x_ids]
 
-    # Unroll the 12 model layers in Python rather than wrapping the
-    # recurrent matrix-state computation in a second lax.scan. This is
-    # mathematically equivalent for the fixed 12-layer architecture but
-    # prevents XLA from materializing a [layers, time, batch, 512, 512]
-    # training-history tensor.
-    layer_outputs_list = []
-    for layer_index in range(len(p["layers"])):
-        layer = jax.tree_util.tree_map(
-            lambda a, i=layer_index: a[i],
-            p["layers"],
-        )
+    def scan_layer(x_in, layer):
         layer_out = factorized_memory_feedback_archive_layer_fwd(
             layer,
-            x,
+            x_in,
         )
-        x = x + layer_out
-        layer_outputs_list.append(x)
+        x_out = x_in + layer_out
+        return x_out, x_out
 
-    layer_outputs = jnp.stack(layer_outputs_list, axis=0)
+    x, layer_outputs = jax.lax.scan(
+        scan_layer,
+        x,
+        p["layers"],
+    )
 
     layer_indexes = jnp.array(
         [layer - 1 for layer in auxiliary_layers],
