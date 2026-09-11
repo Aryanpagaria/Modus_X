@@ -5,6 +5,10 @@ memory can cooperate with recurrent computation. This repository preserves the
 published v1.1.1 line and includes the v2 research series as separate,
 versioned packages.
 
+**New to the project?** Start with [START_HERE.md](START_HERE.md). It provides
+one verified local CPU test, one bounded Kaggle TPU smoke, and a safe path from
+reading the paper to contributing an experiment.
+
 ## Releases
 
 ### Modus_X 2.1.0
