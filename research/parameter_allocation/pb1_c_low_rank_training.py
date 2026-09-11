@@ -312,7 +312,7 @@ def factorized_memory_feedback_archive_layer_fwd(
 
     No dense Q/K reconstruction occurs.
     """
-    r = layer["m_wk_A"].shape[1]
+    r = layer["m_wk_A"].shape[0]
 
     def step(carry, e_raw):
         H_current, H_archive, s = carry
