@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import functools
 import json
 import math
 import os
@@ -99,7 +98,7 @@ GPU_REFERENCES = {
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="PB1-C FINAL T4x2 trainer — corrected two-replica low-rank Q/K with 32-token truncated BPTT"
+        description="PB1-C FINAL T4x2 trainer — two-replica low-rank Q/K with 32-token truncated BPTT"
     )
 
     p.add_argument(
@@ -753,127 +752,92 @@ def factorized_deep_supervision_fwd_stateful(
     dropout_rate: float = 0.0,
     recurrent_states: tuple | None = None,
 ):
-    """Stateful factorized forward used by the T4x2 trainer.
-
-    Inside pmap, recurrent_states is exactly three layer-stacked arrays:
-        H_current_all: [n_layers, ax_res, ax_res]
-        H_archive_all: [n_layers, ax_res, ax_res]
-        s_all:         [n_layers, mamba_state_dim]
-
-    The replica axis is supplied by pmap and is therefore not present here.
-    """
     x = p["embed"][x_ids]
-    n_layers = len(p["layers"]["m_wk_A"])
 
     if recurrent_states is None:
-        ax_res = p["layers"]["m_wk_A"][0].shape[0]
-        mamba_dim = p["layers"]["s_wu"][0].shape[0]
-        recurrent_states = (
-            jnp.zeros((n_layers, ax_res, ax_res), dtype=jnp.float32),
-            jnp.zeros((n_layers, ax_res, ax_res), dtype=jnp.float32),
-            jnp.zeros((n_layers, mamba_dim), dtype=jnp.float32),
+        recurrent_states = tuple(
+            (
+                jnp.zeros((p["layers"]["m_wk_A"][i].shape[0], p["layers"]["m_wk_A"][i].shape[0]), dtype=jnp.float32),
+                jnp.zeros((p["layers"]["m_wk_A"][i].shape[0], p["layers"]["m_wk_A"][i].shape[0]), dtype=jnp.float32),
+                jnp.zeros(p["layers"]["s_wu"][i].shape[0], dtype=jnp.float32),
+            )
+            for i in range(len(p["layers"]["m_wk_A"]))
         )
 
-    if not isinstance(recurrent_states, tuple) or len(recurrent_states) != 3:
-        raise RuntimeError(
-            "Invalid recurrent state: expected (H_current_all, H_archive_all, s_all), "
-            f"got {type(recurrent_states)} with "
-            f"len={len(recurrent_states) if isinstance(recurrent_states, tuple) else 'N/A'}"
-        )
-
-    H_current_all, H_archive_all, s_all = recurrent_states
-
-    if H_current_all.ndim != 3 or H_current_all.shape[0] != n_layers:
-        raise RuntimeError(
-            f"H_current_all shape {H_current_all.shape}; expected ({n_layers}, ax_res, ax_res)"
-        )
-    if H_archive_all.ndim != 3 or H_archive_all.shape[0] != n_layers:
-        raise RuntimeError(
-            f"H_archive_all shape {H_archive_all.shape}; expected ({n_layers}, ax_res, ax_res)"
-        )
-    if s_all.ndim != 2 or s_all.shape[0] != n_layers:
-        raise RuntimeError(
-            f"s_all shape {s_all.shape}; expected ({n_layers}, mamba_state_dim)"
-        )
-
-    new_H_current = []
-    new_H_archive = []
-    new_s = []
+    new_states = []
     layer_outputs_list = []
-
-    for layer_index in range(n_layers):
+    # p["layers"] is a dictionary of stacked parameter arrays; its length
+    # is the number of parameter families, not the number of model layers.
+    # Use a known layer-stacked parameter to determine the 12 layer count.
+    for layer_index in range(len(p["layers"]["m_wk_A"])):
         layer = jax.tree_util.tree_map(
             lambda a, i=layer_index: a[i],
             p["layers"],
         )
-
-        layer_state = (
-            H_current_all[layer_index],
-            H_archive_all[layer_index],
-            s_all[layer_index],
-        )
-
         layer_out, new_state = jax.checkpoint(
             factorized_memory_feedback_archive_layer_fwd_stateful
-        )(layer, x, layer_state)
-
+        )(layer, x, recurrent_states[layer_index])
         x = x + layer_out
-        new_H_current.append(new_state[0])
-        new_H_archive.append(new_state[1])
-        new_s.append(new_state[2])
+        new_states.append(new_state)
         layer_outputs_list.append(x)
 
-    new_states = (
-        jnp.stack(new_H_current, axis=0),
-        jnp.stack(new_H_archive, axis=0),
-        jnp.stack(new_s, axis=0),
-    )
-
     layer_outputs = jnp.stack(layer_outputs_list, axis=0)
+
     layer_indexes = jnp.array(
         [layer - 1 for layer in auxiliary_layers],
         dtype=jnp.int32,
     )
+
     selected_outputs = layer_outputs[layer_indexes]
 
     if dropout_key is not None and dropout_rate > 0.0:
         final_key, aux_key = jax.random.split(dropout_key)
-        x_for_head = _apply_dropout(x, final_key, dropout_rate)
+        x_for_head = _apply_dropout(
+            x,
+            final_key,
+            dropout_rate,
+        )
         selected_for_heads = _apply_dropout(
-            selected_outputs, aux_key, dropout_rate
+            selected_outputs,
+            aux_key,
+            dropout_rate,
         )
     else:
         x_for_head = x
         selected_for_heads = selected_outputs
 
-    final_logits = lm_head_fwd(p["head"], x_for_head)
+    final_logits = lm_head_fwd(
+        p["head"],
+        x_for_head,
+    )
+
     auxiliary_logits = jax.vmap(
         lambda h: lm_head_fwd(p["head"], h)
     )(selected_for_heads)
 
     if "future_heads" in p:
         future_logits = jax.vmap(
-            lambda head: lm_head_fwd(head, x_for_head)
+            lambda head: lm_head_fwd(
+                head,
+                x_for_head,
+            )
         )(p["future_heads"])
+
         auxiliary_future_logits = jax.vmap(
             lambda head: jax.vmap(
                 lambda h: lm_head_fwd(head, h)
             )(selected_for_heads)
         )(p["future_heads"])
-        return (
-            (
-                final_logits,
-                auxiliary_logits,
-                future_logits,
-                auxiliary_future_logits,
-            ),
-            new_states,
-        )
 
-    return (
-        (final_logits, auxiliary_logits, None, None),
-        new_states,
-    )
+        return (
+            final_logits,
+            auxiliary_logits,
+            future_logits,
+            auxiliary_future_logits,
+        ), tuple(new_states)
+
+    return (final_logits, auxiliary_logits, None, None), tuple(new_states)
+
 
 def _apply_dropout(
     x: jax.Array,
@@ -1317,8 +1281,8 @@ def main() -> None:
     if args.train_chunk_len != 32:
         raise ValueError("PB1-C v5 requires --train-chunk-len 32 for the declared 32-token BPTT protocol.")
 
+    chars_per_step = args.train_chunk_len
     per_replica_chars_per_step = args.train_chunk_len
-    chars_per_step = per_replica_chars_per_step * 2
 
     total_steps = math.ceil(
         args.target_chars / chars_per_step
@@ -1399,6 +1363,15 @@ def main() -> None:
     print("Gradient synchronization       : pmean across the two T4s")
     print("Protocol note                  : effective batch/state semantics differ from PB1-C batch-1")
 
+    # Capture per-layer shapes from the UN-replicated params before they are
+    # broadcast across devices below. Indexing the post-replication arrays
+    # here would peel off the replica axis (length 2) instead of the layer
+    # axis (length 12), and would report a layer's own dimension as if it
+    # were the low-rank size.
+    n_layers = factorized_params["layers"]["m_wk_A"].shape[0]
+    rank_r = factorized_params["layers"]["m_wk_A"].shape[1]
+    mamba_state_dim = factorized_params["layers"]["s_wu"].shape[1]
+
     # Replicate model and optimizer state explicitly. Each replica receives
     # the same parameters and optimizer state.
     factorized_params = jax.device_put_replicated(
@@ -1410,44 +1383,32 @@ def main() -> None:
         all_devices,
     )
 
-    # ------------------------------------------------------------------------
-    # T4x2 RECURRENT STATE
-    # ------------------------------------------------------------------------
-    # Before pmap:
-    #   H_current_all = [2, n_layers, ax_res, ax_res]
-    #   H_archive_all = [2, n_layers, ax_res, ax_res]
-    #   s_all         = [2, n_layers, mamba_state_dim]
-    #
-    # Inside each pmap replica the first axis is removed automatically.
-    # The forward function therefore receives [n_layers, ...].
-
-    n_layers = len(factorized_params["layers"]["m_wk_A"])
-    ax_res = int(factorized_params["layers"]["m_wk_A"][0, 0].shape[0])
-    mamba_dim = int(factorized_params["layers"]["s_wu"][0, 0].shape[0])
-
-    H_current_host = np.zeros(
-        (2, n_layers, ax_res, ax_res),
-        dtype=np.float32,
+    # Build a per-replica state tree with the same shapes as one model state.
+    one_states = tuple(
+        (
+            jnp.zeros(
+                (rank_r, rank_r),
+                dtype=jnp.float32,
+            ),
+            jnp.zeros(
+                (rank_r, rank_r),
+                dtype=jnp.float32,
+            ),
+            jnp.zeros(
+                mamba_state_dim,
+                dtype=jnp.float32,
+            ),
+        )
+        for _ in range(n_layers)
     )
-    H_archive_host = np.zeros(
-        (2, n_layers, ax_res, ax_res),
-        dtype=np.float32,
+    recurrent_states = jax.tree_util.tree_map(
+        lambda v: jnp.stack([v, v], axis=0),
+        one_states,
     )
-    s_host = np.zeros(
-        (2, n_layers, mamba_dim),
-        dtype=np.float32,
-    )
-
-    recurrent_states = (
-        jax.device_put_sharded(
-            [H_current_host[0], H_current_host[1]], all_devices
-        ),
-        jax.device_put_sharded(
-            [H_archive_host[0], H_archive_host[1]], all_devices
-        ),
-        jax.device_put_sharded(
-            [s_host[0], s_host[1]], all_devices
-        ),
+    recurrent_states = jax.device_put_sharded(
+        [jax.tree_util.tree_map(lambda x: x[0], recurrent_states),
+         jax.tree_util.tree_map(lambda x: x[1], recurrent_states)],
+        all_devices,
     )
 
     # ------------------------------------------------------------------------
@@ -1495,7 +1456,7 @@ def main() -> None:
 
         return loss
 
-    @functools.partial(jax.pmap, axis_name="replica")
+    @jax.pmap(axis_name="replica")
     def update(params, state, recurrent_states, x, y):
         def objective(pp):
             outputs, new_states = factorized_deep_supervision_fwd_stateful(
@@ -1580,21 +1541,6 @@ def main() -> None:
             all_devices,
         )
         resume_recurrent_states = state.get("recurrent_states")
-        if resume_recurrent_states is not None:
-            recurrent_states = tuple(
-                jax.device_put_sharded(
-                    [np.asarray(tree[0]), np.asarray(tree[1])],
-                    all_devices,
-                )
-                for tree in resume_recurrent_states
-            )
-
-        if state.get("stream_starts") is not None:
-            stream_starts = [int(v) for v in state["stream_starts"]]
-            atomic_json(
-                stream_path,
-                {"stream_starts": stream_starts},
-            )
 
         rng.bit_generator.state = state[
             "rng_state"
@@ -1630,7 +1576,7 @@ def main() -> None:
         "seq_len": args.input_seq_len,
         "loss_tail": args.loss_tail,
         "train_seq_len": args.train_chunk_len,
-        "chars_per_step": chars_per_step,
+        "chars_per_step": chars_per_step * 2,
         "target_chars": args.target_chars,
         "total_steps": total_steps,
         "stop_steps": stop_steps,
@@ -1668,7 +1614,7 @@ def main() -> None:
         "protocol_change_from_pb1_c_batch1": True,
         "backend": jax.default_backend(),
         "visible_devices": [str(d) for d in jax.devices()],
-        "training_device": str(train_device),
+        "training_device": "+".join(str(d) for d in all_devices),
         "t4_mode": "two-device-data-parallel-batch-2",
         "timer": {
             "first_update_includes_jax_compile": True,
@@ -1696,16 +1642,6 @@ def main() -> None:
     # TRAIN
     # ------------------------------------------------------------------------
 
-    # Final preflight checks for the pmap state layout. These run before the
-    # first compiled update and fail clearly if the representation is wrong.
-    assert len(recurrent_states) == 3
-    for state_array, expected_ndim in zip(recurrent_states, (3, 3, 2)):
-        if state_array.ndim != expected_ndim + 1:
-            raise RuntimeError(
-                f"T4x2 recurrent state has wrong rank {state_array.ndim}; "
-                f"expected {expected_ndim + 1} before pmap (including replica axis)."
-            )
-
     started = time.perf_counter()
     first_update_wall = None
 
@@ -1718,14 +1654,15 @@ def main() -> None:
         # remains continuous in the forward pass while the gradient is
         # truncated at every optimizer-step boundary.
         if step == start_step + 1:
-            max_start = len(train) - max(per_replica_chars_per_step * total_steps + 1, 2)
+            max_start = len(train) - max(args.train_chunk_len * total_steps + 1, 2)
             stream_starts = [
                 int(rng.integers(0, max_start)),
                 int(rng.integers(0, max_start)),
             ]
+            stream_state = {"stream_starts": stream_starts}
             atomic_json(
                 stream_path,
-                {"stream_starts": stream_starts},
+                stream_state,
             )
         else:
             stream_starts = stream_state["stream_starts"]
@@ -1881,7 +1818,6 @@ def main() -> None:
                         opt_state
                     ),
                     "recurrent_states": jax.device_get(recurrent_states),
-                    "stream_starts": stream_starts,
                     "rng_state": rng.bit_generator.state,
                     "rows": rows,
                     "elapsed_s": elapsed,
