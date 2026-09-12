@@ -1302,6 +1302,8 @@ def main() -> None:
         )
 
     for output in smoke_outputs:
+        if output is None:
+            continue
         if not np.all(np.isfinite(np.asarray(output))):
             raise RuntimeError(
                 "Non-finite value found in factorized smoke forward."
@@ -1387,11 +1389,13 @@ def main() -> None:
             f"PB1-C T4x2 requires GPU devices; found {all_devices}."
         )
 
+    train_device = "cuda:0 + cuda:1"
+
     print(f"Accelerator backend            : {jax.default_backend()}")
     print(f"Visible accelerator devices    : {len(all_devices)}")
     for i, device in enumerate(all_devices):
         print(f"  device[{i}]                  : {device}")
-    print("PB1-C training devices        : cuda:0 + cuda:1")
+    print(f"PB1-C training devices        : {train_device}")
     print("T4x2 mode                     : two-replica data parallel")
     print("Per-replica batch              : 1")
     print("Global batch                   : 2")
@@ -1421,9 +1425,9 @@ def main() -> None:
     # Inside each pmap replica the first axis is removed automatically.
     # The forward function therefore receives [n_layers, ...].
 
-    n_layers = len(factorized_params["layers"]["m_wk_A"])
-    ax_res = int(factorized_params["layers"]["m_wk_A"][0, 0].shape[0])
-    mamba_dim = int(factorized_params["layers"]["s_wu"][0, 0].shape[0])
+    n_layers = len(factorized_params["layers"]["m_wk_A"][0])
+    ax_res = int(factorized_params["layers"]["m_wk_A"][0][0].shape[0])
+    mamba_dim = int(factorized_params["layers"]["s_wu"][0][0].shape[0])
 
     H_current_host = np.zeros(
         (2, n_layers, ax_res, ax_res),
@@ -1528,8 +1532,6 @@ def main() -> None:
         params = optax.apply_updates(params, updates)
         return params, state, new_states, loss
 
-
-
     # Single-device evaluation helper: validation is not part of the training
     # gradient protocol, so use cuda:0 with eval batch 1 for deterministic
     # checkpoint BPC measurement.
@@ -1563,6 +1565,8 @@ def main() -> None:
     else:
         stream_state = {}
 
+    stream_starts = None
+
     if args.resume and checkpoint_path.exists():
         print("=" * 80)
         print("RESUMING CHECKPOINT")
@@ -1571,6 +1575,7 @@ def main() -> None:
         with checkpoint_path.open("rb") as f:
             state = pickle.load(f)
 
+        # Saved params/opt_state are unsharded (replica 0 slice). Replicate.
         factorized_params = jax.device_put_replicated(
             state["params"],
             all_devices,
@@ -1591,6 +1596,7 @@ def main() -> None:
 
         if state.get("stream_starts") is not None:
             stream_starts = [int(v) for v in state["stream_starts"]]
+            stream_state["stream_starts"] = stream_starts
             atomic_json(
                 stream_path,
                 {"stream_starts": stream_starts},
@@ -1717,18 +1723,17 @@ def main() -> None:
         # by 32 tokens per optimizer update. The recurrent carry therefore
         # remains continuous in the forward pass while the gradient is
         # truncated at every optimizer-step boundary.
-        if step == start_step + 1:
+        if stream_starts is None:
             max_start = len(train) - max(per_replica_chars_per_step * total_steps + 1, 2)
             stream_starts = [
                 int(rng.integers(0, max_start)),
                 int(rng.integers(0, max_start)),
             ]
+            stream_state["stream_starts"] = stream_starts
             atomic_json(
                 stream_path,
                 {"stream_starts": stream_starts},
             )
-        else:
-            stream_starts = stream_state["stream_starts"]
 
         positions = [
             stream_starts[replica]
@@ -1870,17 +1875,22 @@ def main() -> None:
                 },
             )
 
+            # Save replica-0 slices so that resume can use
+            # jax.device_put_replicated without doubling the replica axis.
             atomic_pickle(
                 checkpoint_path,
                 {
                     "step": step,
                     "params": jax.device_get(
-                        factorized_params
+                        jax.tree_util.tree_map(lambda z: z[0], factorized_params)
                     ),
                     "opt_state": jax.device_get(
-                        opt_state
+                        jax.tree_util.tree_map(lambda z: z[0], opt_state)
                     ),
-                    "recurrent_states": jax.device_get(recurrent_states),
+                    "recurrent_states": tuple(
+                        jax.device_get(t)
+                        for t in recurrent_states
+                    ),
                     "stream_starts": stream_starts,
                     "rng_state": rng.bit_generator.state,
                     "rows": rows,
