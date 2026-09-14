@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import functools
 import json
 import math
 import os
@@ -1302,8 +1303,6 @@ def main() -> None:
         )
 
     for output in smoke_outputs:
-        if output is None:
-            continue
         if not np.all(np.isfinite(np.asarray(output))):
             raise RuntimeError(
                 "Non-finite value found in factorized smoke forward."
@@ -1389,13 +1388,16 @@ def main() -> None:
             f"PB1-C T4x2 requires GPU devices; found {all_devices}."
         )
 
+    # Human-readable identifier used only in experiment metadata.
+    # The actual JAX device objects are stored in all_devices and passed to
+    # device_put_sharded/pmap below.
     train_device = "cuda:0 + cuda:1"
 
     print(f"Accelerator backend            : {jax.default_backend()}")
     print(f"Visible accelerator devices    : {len(all_devices)}")
     for i, device in enumerate(all_devices):
         print(f"  device[{i}]                  : {device}")
-    print(f"PB1-C training devices        : {train_device}")
+    print("PB1-C training devices        : cuda:0 + cuda:1")
     print("T4x2 mode                     : two-replica data parallel")
     print("Per-replica batch              : 1")
     print("Global batch                   : 2")
@@ -1425,9 +1427,9 @@ def main() -> None:
     # Inside each pmap replica the first axis is removed automatically.
     # The forward function therefore receives [n_layers, ...].
 
-    n_layers = len(factorized_params["layers"]["m_wk_A"][0])
-    ax_res = int(factorized_params["layers"]["m_wk_A"][0][0].shape[0])
-    mamba_dim = int(factorized_params["layers"]["s_wu"][0][0].shape[0])
+    n_layers = len(factorized_params["layers"]["m_wk_A"])
+    ax_res = int(factorized_params["layers"]["m_wk_A"][0, 0].shape[0])
+    mamba_dim = int(factorized_params["layers"]["s_wu"][0, 0].shape[0])
 
     H_current_host = np.zeros(
         (2, n_layers, ax_res, ax_res),
@@ -1532,6 +1534,8 @@ def main() -> None:
         params = optax.apply_updates(params, updates)
         return params, state, new_states, loss
 
+
+
     # Single-device evaluation helper: validation is not part of the training
     # gradient protocol, so use cuda:0 with eval batch 1 for deterministic
     # checkpoint BPC measurement.
@@ -1565,6 +1569,9 @@ def main() -> None:
     else:
         stream_state = {}
 
+    # Stream starts are part of the training state.  On a fresh run they are
+    # generated once; on resume they are restored exactly, so the two
+    # recurrent streams continue from the same character positions.
     stream_starts = None
 
     if args.resume and checkpoint_path.exists():
@@ -1575,17 +1582,42 @@ def main() -> None:
         with checkpoint_path.open("rb") as f:
             state = pickle.load(f)
 
-        # Saved params/opt_state are unsharded (replica 0 slice). Replicate.
+        # Older PB1-C T4x2 checkpoints stored replicated parameter/optimizer
+        # leaves with a leading [replica] axis.  New checkpoints store one
+        # canonical copy of params/opt_state and keep both replica states.
+        # Accept both formats so resume is backwards-compatible.
+        checkpoint_params_replicated = bool(
+            state.get("params_replicated", True)
+        )
+
+        if checkpoint_params_replicated:
+            saved_params = jax.tree_util.tree_map(
+                lambda z: np.asarray(z)[0],
+                state["params"],
+            )
+            saved_opt_state = jax.tree_util.tree_map(
+                lambda z: np.asarray(z)[0] if np.asarray(z).ndim > 0 else np.asarray(z),
+                state["opt_state"],
+            )
+        else:
+            saved_params = state["params"]
+            saved_opt_state = state["opt_state"]
+
         factorized_params = jax.device_put_replicated(
-            state["params"],
+            saved_params,
             all_devices,
         )
         opt_state = jax.device_put_replicated(
-            state["opt_state"],
+            saved_opt_state,
             all_devices,
         )
+
         resume_recurrent_states = state.get("recurrent_states")
         if resume_recurrent_states is not None:
+            if len(resume_recurrent_states) != 3:
+                raise RuntimeError(
+                    "Checkpoint recurrent_states must contain exactly three arrays."
+                )
             recurrent_states = tuple(
                 jax.device_put_sharded(
                     [np.asarray(tree[0]), np.asarray(tree[1])],
@@ -1594,25 +1626,28 @@ def main() -> None:
                 for tree in resume_recurrent_states
             )
 
-        if state.get("stream_starts") is not None:
-            stream_starts = [int(v) for v in state["stream_starts"]]
-            stream_state["stream_starts"] = stream_starts
-            atomic_json(
-                stream_path,
-                {"stream_starts": stream_starts},
-            )
-
-        rng.bit_generator.state = state[
-            "rng_state"
-        ]
+        rng.bit_generator.state = state["rng_state"]
 
         rows = state["rows"]
-        start_step = state["step"]
-        elapsed_before = state["elapsed_s"]
+        start_step = int(state["step"])
+        elapsed_before = float(state["elapsed_s"])
 
-        print(
-            f"RESUME step={start_step:,}"
-        )
+        saved_stream_starts = state.get("stream_starts")
+        if saved_stream_starts is not None:
+            stream_starts = [int(v) for v in saved_stream_starts]
+        elif stream_state.get("stream_starts") is not None:
+            stream_starts = [int(v) for v in stream_state["stream_starts"]]
+        else:
+            raise RuntimeError(
+                "Checkpoint has no stream_starts; cannot safely resume the "
+                "contiguous recurrent training stream."
+            )
+
+        stream_state = {"stream_starts": stream_starts}
+        atomic_json(stream_path, stream_state)
+
+        print(f"RESUME step={start_step:,}")
+        print(f"RESUME stream_starts={stream_starts}")
 
     # ------------------------------------------------------------------------
     # CONFIG OUTPUT
@@ -1705,12 +1740,21 @@ def main() -> None:
     # Final preflight checks for the pmap state layout. These run before the
     # first compiled update and fail clearly if the representation is wrong.
     assert len(recurrent_states) == 3
-    for state_array, expected_ndim in zip(recurrent_states, (3, 3, 2)):
-        if state_array.ndim != expected_ndim + 1:
+    expected_state_shapes = (
+        (2, n_layers, ax_res, ax_res),
+        (2, n_layers, ax_res, ax_res),
+        (2, n_layers, mamba_dim),
+    )
+    for state_array, expected_shape in zip(recurrent_states, expected_state_shapes):
+        if tuple(state_array.shape) != expected_shape:
             raise RuntimeError(
-                f"T4x2 recurrent state has wrong rank {state_array.ndim}; "
-                f"expected {expected_ndim + 1} before pmap (including replica axis)."
+                f"T4x2 recurrent state has wrong shape {tuple(state_array.shape)}; "
+                f"expected {expected_shape} before pmap."
             )
+    if stream_starts is not None and len(stream_starts) != 2:
+        raise RuntimeError(
+            f"Expected exactly two stream starts for T4x2; got {stream_starts}."
+        )
 
     started = time.perf_counter()
     first_update_wall = None
@@ -1724,16 +1768,24 @@ def main() -> None:
         # remains continuous in the forward pass while the gradient is
         # truncated at every optimizer-step boundary.
         if stream_starts is None:
-            max_start = len(train) - max(per_replica_chars_per_step * total_steps + 1, 2)
+            # Pick each replica's contiguous stream exactly once.  The maximum
+            # start guarantees that the complete requested training horizon
+            # plus the one look-ahead byte fits inside the 90M training split.
+            max_start = len(train) - max(
+                per_replica_chars_per_step * total_steps + 1,
+                2,
+            )
+            if max_start <= 0:
+                raise RuntimeError(
+                    f"Training split is too short for the requested stream: {len(train):,} bytes."
+                )
             stream_starts = [
                 int(rng.integers(0, max_start)),
                 int(rng.integers(0, max_start)),
             ]
-            stream_state["stream_starts"] = stream_starts
-            atomic_json(
-                stream_path,
-                {"stream_starts": stream_starts},
-            )
+            stream_state = {"stream_starts": stream_starts}
+            atomic_json(stream_path, stream_state)
+            print(f"TRAIN stream_starts={stream_starts}", flush=True)
 
         positions = [
             stream_starts[replica]
@@ -1875,23 +1927,25 @@ def main() -> None:
                 },
             )
 
-            # Save replica-0 slices so that resume can use
-            # jax.device_put_replicated without doubling the replica axis.
             atomic_pickle(
                 checkpoint_path,
                 {
                     "step": step,
+                    # Params and optimizer state are identical across replicas;
+                    # save one canonical copy to avoid doubling checkpoint size
+                    # and to make device_put_replicated() on resume exact.
                     "params": jax.device_get(
                         jax.tree_util.tree_map(lambda z: z[0], factorized_params)
                     ),
                     "opt_state": jax.device_get(
                         jax.tree_util.tree_map(lambda z: z[0], opt_state)
                     ),
-                    "recurrent_states": tuple(
-                        jax.device_get(t)
-                        for t in recurrent_states
-                    ),
-                    "stream_starts": stream_starts,
+                    "params_replicated": False,
+                    # Recurrent state is intentionally NOT collapsed: replica 0
+                    # and replica 1 follow different data streams and therefore
+                    # have different states.
+                    "recurrent_states": jax.device_get(recurrent_states),
+                    "stream_starts": list(stream_starts),
                     "rng_state": rng.bit_generator.state,
                     "rows": rows,
                     "elapsed_s": elapsed,
