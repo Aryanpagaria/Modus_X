@@ -250,46 +250,136 @@ def factorize_weight(
     return jnp.stack(layers), jnp.stack(b_layers)
 
 
-def convert_dense_to_factorized(
-    dense_params: Dict[str, Any],
+def factorize_weight(
+    weight: jax.Array,
+    rank: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Balanced truncated-SVD factorization for [layers, out, in] weights."""
+    weight = jnp.asarray(weight, dtype=jnp.float32)
+    if weight.ndim != 3:
+        raise ValueError(f"Expected [layers,out,in], got {weight.shape}")
+    if not 0 < rank < min(weight.shape[1:]):
+        raise ValueError(
+            f"Rank {rank} must satisfy 0 < rank < {min(weight.shape[1:])} "
+            f"for weight shape {weight.shape}."
+        )
+
+    a_layers = []
+    b_layers = []
+    for layer_index in range(weight.shape[0]):
+        w = weight[layer_index]
+        u, s, vh = jnp.linalg.svd(w, full_matrices=False)
+        sr = s[:rank]
+        root = jnp.sqrt(jnp.maximum(sr, 0.0))
+        a_layers.append(u[:, :rank] * root[None, :])
+        b_layers.append(root[:, None] * vh[:rank, :])
+
+    return jnp.stack(a_layers), jnp.stack(b_layers)
+
+
+def _copy_overlap(
+    source: Any,
+    target: Any,
+    path: str,
+) -> Any:
+    """Copy the canonical prefix into a larger C1 tensor, preserving C1 extras."""
+    if isinstance(source, dict) and isinstance(target, dict):
+        if set(source) != set(target):
+            missing = sorted(set(source) - set(target))
+            extra = sorted(set(target) - set(source))
+            raise RuntimeError(
+                f"Parameter-tree keys differ at {path or '<root>'}: "
+                f"missing_in_target={missing}, extra_in_target={extra}."
+            )
+        return {
+            key: _copy_overlap(source[key], target[key], f"{path}.{key}" if path else key)
+            for key in target
+        }
+
+    if isinstance(source, (tuple, list)) and isinstance(target, type(source)):
+        if len(source) != len(target):
+            raise RuntimeError(f"Sequence length mismatch at {path}.")
+        values = [
+            _copy_overlap(src, dst, f"{path}[{i}]")
+            for i, (src, dst) in enumerate(zip(source, target))
+        ]
+        return type(target)(values)
+
+    if hasattr(source, "shape") and hasattr(target, "shape"):
+        src = jnp.asarray(source)
+        dst = jnp.asarray(target)
+        if src.ndim != dst.ndim:
+            raise RuntimeError(
+                f"Rank mismatch at {path}: canonical={src.shape}, C1={dst.shape}."
+            )
+        if src.shape == dst.shape:
+            return src.astype(dst.dtype)
+        if any(s > d for s, d in zip(src.shape, dst.shape)):
+            raise RuntimeError(
+                f"C1 tensor is smaller than canonical tensor at {path}: "
+                f"canonical={src.shape}, C1={dst.shape}."
+            )
+        slices = tuple(slice(0, s) for s in src.shape)
+        return dst.at[slices].set(src.astype(dst.dtype))
+
+    if source != target:
+        raise RuntimeError(f"Non-array parameter leaf differs at {path}: {source!r} != {target!r}")
+    return target
+
+
+def build_c1_from_canonical(
+    canonical_params: Dict[str, Any],
+    c1_dense_params: Dict[str, Any],
     q_rank: int,
     k_rank: int,
 ) -> tuple[Dict[str, Any], Dict[str, int]]:
-    layers = dense_params["layers"]
+    """
+    Construct the *actual* C1 tree.
 
-    q_a, q_b = factorize_weight(layers["m_wq"], q_rank)
-    k_a, k_b = factorize_weight(layers["m_wk"], k_rank)
+    1. Start from a freshly initialized C1 dense tree so all newly introduced
+       hidden/mamba capacity has the target architecture's native initialization.
+    2. Copy every canonical parameter into its overlapping C1 region.
+    3. Replace only m_wq/m_wk with balanced rank-128 factors derived from the
+       canonical dense donor.
 
-    new_layers = dict(layers)
+    This is deliberately architecture-aware without hard-coding individual
+    hidden/mamba tensor names. Any future shape mismatch fails loudly instead
+    of silently training the wrong tree.
+    """
+    canonical_layers = canonical_params["layers"]
+    c1_layers = c1_dense_params["layers"]
 
-    new_layers.pop("m_wq")
-    new_layers.pop("m_wk")
+    q_dense = canonical_layers["m_wq"]
+    k_dense = canonical_layers["m_wk"]
+    q_a, q_b = factorize_weight(q_dense, q_rank)
+    k_a, k_b = factorize_weight(k_dense, k_rank)
 
-    new_layers["m_wq_A"] = q_a
-    new_layers["m_wq_B"] = q_b
-    new_layers["m_wk_A"] = k_a
-    new_layers["m_wk_B"] = k_b
+    copied = _copy_overlap(canonical_params, c1_dense_params, "")
+    layers = dict(copied["layers"])
+    layers.pop("m_wq", None)
+    layers.pop("m_wk", None)
+    layers["m_wq_A"] = q_a
+    layers["m_wq_B"] = q_b
+    layers["m_wk_A"] = k_a
+    layers["m_wk_B"] = k_b
 
-    factorized = dict(dense_params)
-    factorized["layers"] = new_layers
+    final_params = dict(copied)
+    final_params["layers"] = layers
 
-    q_dense = int(np.prod(layers["m_wq"].shape))
-    k_dense = int(np.prod(layers["m_wk"].shape))
-
-    q_factor = int(np.prod(q_a.shape) + np.prod(q_b.shape))
-    k_factor = int(np.prod(k_a.shape) + np.prod(k_b.shape))
-
+    q_dense_n = int(np.prod(q_dense.shape))
+    k_dense_n = int(np.prod(k_dense.shape))
+    q_factor_n = int(np.prod(q_a.shape) + np.prod(q_b.shape))
+    k_factor_n = int(np.prod(k_a.shape) + np.prod(k_b.shape))
     stats = {
-        "q_dense_params": q_dense,
-        "q_factor_params": q_factor,
-        "q_savings": q_dense - q_factor,
-        "k_dense_params": k_dense,
-        "k_factor_params": k_factor,
-        "k_savings": k_dense - k_factor,
-        "qk_savings": (q_dense - q_factor) + (k_dense - k_factor),
+        "q_dense_params": q_dense_n,
+        "q_factor_params": q_factor_n,
+        "q_savings": q_dense_n - q_factor_n,
+        "k_dense_params": k_dense_n,
+        "k_factor_params": k_factor_n,
+        "k_savings": k_dense_n - k_factor_n,
+        "qk_savings": (q_dense_n - q_factor_n) + (k_dense_n - k_factor_n),
     }
-
-    return factorized, stats
+    return final_params, stats
 
 
 # ============================================================================
@@ -1131,9 +1221,9 @@ def main() -> None:
             "The final C1 protocol requires --train-chunk-len 32."
         )
 
-    if args.batch % jax.device_count():
-        raise ValueError("Global batch must divide TPU device count.")
-
+    # Training is intentionally a singleton recurrent stream. Do not shard the
+    # batch dimension: batch=1 cannot be partitioned across an 8-device mesh.
+    # Evaluation is batched and is sharded across the TPU data axis.
     if args.eval_batch % jax.device_count():
         raise ValueError("Evaluation batch must divide TPU device count.")
 
@@ -1166,7 +1256,10 @@ def main() -> None:
     canonical_cfg = build_canonical_config()
     cfg = build_config()
 
-    dense_params, _official_fwd = make_model(
+    # The donor and target are intentionally initialized separately. The target
+    # C1 tree owns the expanded hidden/mamba tensors; the canonical tree supplies
+    # the transferable weights and the dense Q/K matrices used for SVD.
+    canonical_params, _ = make_model(
         MODEL_NAME,
         jax.random.key(args.seed),
         canonical_cfg,
@@ -1174,22 +1267,33 @@ def main() -> None:
         future_target_count=CANONICAL["future_target_count"],
         dropout_rate=0.0,
     )
+    canonical_count = int(count_params(canonical_params))
 
-    dense_count = int(count_params(dense_params))
-
-    print("=" * 80)
-    print("INITIALIZATION DONOR")
-    print("=" * 80)
-    print(f"Canonical dense parameters   : {dense_count:,}")
-
-    if dense_count != CANONICAL_PARAMS:
+    if canonical_count != CANONICAL_PARAMS:
         raise RuntimeError(
             f"Canonical dense donor mismatch: expected {CANONICAL_PARAMS:,}, "
-            f"found {dense_count:,}."
+            f"found {canonical_count:,}."
         )
 
-    factorized_params, factor_stats = convert_dense_to_factorized(
-        dense_params,
+    c1_dense_params, _ = make_model(
+        MODEL_NAME,
+        jax.random.key(args.seed + 1),
+        cfg,
+        auxiliary_layers=CANONICAL["aux_layers"],
+        future_target_count=CANONICAL["future_target_count"],
+        dropout_rate=0.0,
+    )
+    c1_dense_count = int(count_params(c1_dense_params))
+
+    print("=" * 80)
+    print("INITIALIZATION DONOR / TARGET")
+    print("=" * 80)
+    print(f"Canonical dense parameters   : {canonical_count:,}")
+    print(f"C1 dense target parameters   : {c1_dense_count:,}")
+
+    factorized_params, factor_stats = build_c1_from_canonical(
+        canonical_params,
+        c1_dense_params,
         final_arch["q_rank"],
         final_arch["k_rank"],
     )
@@ -1214,8 +1318,6 @@ def main() -> None:
             "Final C1 is unexpectedly far from the fixed parameter budget."
         )
 
-    # Explicitly verify that the dense Q/K leaves were removed and the native
-    # trainable tree contains the four factorized Q/K families.
     layers = factorized_params["layers"]
     required_factorized = ("m_wq_A", "m_wq_B", "m_wk_A", "m_wk_B")
     forbidden_dense = ("m_wq", "m_wk")
@@ -1227,23 +1329,13 @@ def main() -> None:
         if name in layers:
             raise RuntimeError(f"Dense Q/K parameter unexpectedly remains: {name}")
 
-    q_shape = tuple(layers["m_wq_A"].shape)
-    qb_shape = tuple(layers["m_wq_B"].shape)
-    k_shape = tuple(layers["m_wk_A"].shape)
-    kb_shape = tuple(layers["m_wk_B"].shape)
-
     expected_shapes = {
         "m_wq_A": (CANONICAL["n_layers"], CANONICAL["embed_dim"], final_arch["q_rank"]),
         "m_wq_B": (CANONICAL["n_layers"], final_arch["q_rank"], CANONICAL["embed_dim"]),
         "m_wk_A": (CANONICAL["n_layers"], CANONICAL["embed_dim"], final_arch["k_rank"]),
         "m_wk_B": (CANONICAL["n_layers"], final_arch["k_rank"], CANONICAL["embed_dim"]),
     }
-    actual_shapes = {
-        "m_wq_A": q_shape,
-        "m_wq_B": qb_shape,
-        "m_wk_A": k_shape,
-        "m_wk_B": kb_shape,
-    }
+    actual_shapes = {name: tuple(layers[name].shape) for name in expected_shapes}
     if actual_shapes != expected_shapes:
         raise RuntimeError(
             f"Final C1 Q/K factor shapes mismatch: expected {expected_shapes}, "
@@ -1253,6 +1345,7 @@ def main() -> None:
     print("Exact parameter count         : PASS")
     print("Dense Q/K removed             : PASS")
     print("Native Q/K factor shapes      : PASS")
+    print()
 
     # ------------------------------------------------------------------------
     # TRUE FACTORIZED FORWARD
@@ -1449,36 +1542,55 @@ def main() -> None:
     rows = []
     start_step = 0
     elapsed_before = 0.0
-    resume_recurrent_states = None
 
     stream_path = outdir / "stream_state.json"
-    stream_state = {}
-    if stream_path.exists():
-        stream_state = json.loads(stream_path.read_text(encoding="utf-8"))
+    if args.resume:
+        if not checkpoint_path.exists():
+            raise RuntimeError("--resume was requested but checkpoint.pkl does not exist.")
+        if not stream_path.exists():
+            raise RuntimeError("--resume was requested but stream_state.json does not exist.")
 
-    if args.resume and checkpoint_path.exists():
         print("=" * 80)
         print("RESUMING FINAL C1 CHECKPOINT")
         print("=" * 80)
 
         with checkpoint_path.open("rb") as f:
             state = pickle.load(f)
+        stream_state = json.loads(stream_path.read_text(encoding="utf-8"))
 
-        if state.get("architecture") not in (None, final_arch["name"]):
+        if state.get("architecture") != final_arch["name"]:
             raise RuntimeError(
                 f"Checkpoint architecture mismatch: {state.get('architecture')} "
                 f"vs {final_arch['name']}."
             )
+        if int(state.get("parameters", measured_count)) != measured_count:
+            raise RuntimeError("Checkpoint parameter count does not match final C1.")
+        if int(stream_state.get("stream_start", -1)) < 0:
+            raise RuntimeError("stream_state.json contains an invalid stream_start.")
 
         factorized_params = jax.device_put(state["params"], replicated)
         opt_state = jax.device_put(state["opt_state"], replicated)
-        resume_recurrent_states = state.get("recurrent_states")
+        recurrent_states = jax.device_put(state["recurrent_states"], replicated)
         rng.bit_generator.state = state["rng_state"]
-        rows = state["rows"]
-        start_step = state["step"]
-        elapsed_before = state["elapsed_s"]
+        rows = state.get("rows", [])
+        start_step = int(state["step"])
+        elapsed_before = float(state.get("elapsed_s", 0.0))
+        stream_start = int(stream_state["stream_start"])
 
         print(f"RESUME step={start_step:,}")
+    else:
+        # A fresh run gets a deterministic stream start from the experiment
+        # seed. Existing output is intentionally ignored/replaced.
+        max_stream_span = args.train_chunk_len * total_steps + 1
+        if len(train) < max_stream_span:
+            raise RuntimeError(
+                f"Training split is too short for {args.target_chars:,} characters: "
+                f"need at least {max_stream_span:,} bytes, have {len(train):,}."
+            )
+        stream_start = int(
+            rng.integers(0, len(train) - max(max_stream_span, 2))
+        )
+        atomic_json(stream_path, {"stream_start": stream_start})
 
     # ------------------------------------------------------------------------
     # CONFIG OUTPUT
@@ -1497,7 +1609,7 @@ def main() -> None:
         "canonical_budget": CANONICAL_PARAMS,
         "measured_parameters": measured_count,
         "budget_error": measured_count - CANONICAL_PARAMS,
-        "dense_donor_parameters": dense_count,
+        "dense_donor_parameters": canonical_count,
         "qk_savings": factor_stats["qk_savings"],
         "batch": args.batch,
         "seq_len": args.input_seq_len,
@@ -1555,24 +1667,9 @@ def main() -> None:
     started = time.perf_counter()
 
     for step in range(start_step + 1, stop_steps + 1):
-        if step == start_step + 1:
-            max_stream_span = args.train_chunk_len * total_steps + 1
-            stream_start = int(
-                rng.integers(
-                    0,
-                    len(train) - max(max_stream_span, 2),
-                )
-            )
-            atomic_json(stream_path, {"stream_start": stream_start})
-        else:
-            if "stream_start" not in stream_state:
-                raise RuntimeError(
-                    "stream_state.json exists but has no stream_start. "
-                    "Delete the stale stream_state.json and restart without --resume."
-                )
-            stream_start = int(stream_state["stream_start"])
-
-        pos = stream_start + (step - start_step - 1) * args.train_chunk_len
+        # The stream is global to the run. On resume, step N+1 must consume the
+        # chunk immediately after step N; never restart or duplicate the stream.
+        pos = stream_start + (step - 1) * args.train_chunk_len
         chunk = train[pos : pos + args.train_chunk_len + 1]
 
         if len(chunk) != args.train_chunk_len + 1:
@@ -1581,21 +1678,15 @@ def main() -> None:
                 f"requested {args.train_chunk_len + 1} bytes, got {len(chunk)}."
             )
 
-        x = jax.device_put(
-            chunk[:-1][None, :].astype(np.int32),
-            batch_sharding,
-        )
-        y = jax.device_put(
-            chunk[1:][None, :].astype(np.int32),
-            batch_sharding,
-        )
+        x = jnp.asarray(chunk[:-1].astype(np.int32))
+        y = jnp.asarray(chunk[1:].astype(np.int32))
 
         factorized_params, opt_state, recurrent_states, loss = update(
             factorized_params,
             opt_state,
             recurrent_states,
-            x[0],
-            y[0],
+            x,
+            y,
         )
 
         if step == start_step + 1 or step % 10 == 0:
@@ -1642,6 +1733,7 @@ def main() -> None:
                 checkpoint_path,
                 {
                     "architecture": final_arch["name"],
+                    "parameters": measured_count,
                     "step": step,
                     "params": jax.device_get(factorized_params),
                     "opt_state": jax.device_get(opt_state),
