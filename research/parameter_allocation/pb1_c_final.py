@@ -172,7 +172,24 @@ def batch_at(
 # MODEL CONFIG
 # ============================================================================
 
+def build_canonical_config() -> ModelConfig:
+    """Exact 47,437,768-parameter dense donor configuration."""
+    return ModelConfig(
+        vocab_size=CANONICAL["vocab_size"],
+        embed_dim=CANONICAL["embed_dim"],
+        hidden_dim=1536,
+        ax_res=CANONICAL["embed_dim"],
+        n_layers=CANONICAL["n_layers"],
+        n_heads_attn=CANONICAL["n_heads"],
+        seq_len=CANONICAL["seq_len"],
+        mamba_state_dim=512,
+        vector_router=CANONICAL["vector_router"],
+        router_hidden=CANONICAL["router_hidden"],
+    )
+
+
 def build_config() -> ModelConfig:
+    """Final C1 runtime configuration."""
     return ModelConfig(
         vocab_size=CANONICAL["vocab_size"],
         embed_dim=CANONICAL["embed_dim"],
@@ -185,7 +202,6 @@ def build_config() -> ModelConfig:
         vector_router=CANONICAL["vector_router"],
         router_hidden=CANONICAL["router_hidden"],
     )
-
 
 # ============================================================================
 # LOW-RANK INITIALIZATION
@@ -1147,15 +1163,13 @@ def main() -> None:
     # MODEL INITIALIZATION
     # ------------------------------------------------------------------------
 
+    canonical_cfg = build_canonical_config()
     cfg = build_config()
 
-    # The dense model is used only as a deterministic initialization donor.
-    # After SVD conversion, the trainable parameter tree contains ONLY the
-    # factorized Q/K tensors; no dense m_wq/m_wk tensors remain.
     dense_params, _official_fwd = make_model(
         MODEL_NAME,
         jax.random.key(args.seed),
-        cfg,
+        canonical_cfg,
         auxiliary_layers=CANONICAL["aux_layers"],
         future_target_count=CANONICAL["future_target_count"],
         dropout_rate=0.0,
